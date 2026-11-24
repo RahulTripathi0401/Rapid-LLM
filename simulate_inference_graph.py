@@ -66,6 +66,83 @@ class DecodeSample:
     kv_cache_tokens: int
 
 
+@dataclass
+class BlockDiffusionSchedule:
+    """Project 3: block-diffusion decode schedule, read from ``project_param``.
+
+    The output (``decode_len`` tokens) is written in blocks of ``block_size`` (b) tokens.
+    Each block is refined over ``refine_rounds`` (R) model calls; every call processes all
+    b positions of the block together and reads the KV cache of all earlier text (prompt
+    plus finished blocks). With ``kv_save_pass: true`` each block costs one more call that
+    recomputes and stores the final K/V of the block (the slides' R + 1 variant); by
+    default the finished block's K/V is kept from its last refinement call (R calls per
+    block, as in PROJECTS.md). b = 1 and R = 1 (no extra pass) is exactly normal decode.
+    """
+
+    block_size: int
+    refine_rounds: int
+    kv_save_pass: bool
+    decode_len: int
+
+    @property
+    def num_blocks(self) -> int:
+        return self.decode_len // self.block_size
+
+    @property
+    def calls_per_block(self) -> int:
+        return self.refine_rounds + (1 if self.kv_save_pass else 0)
+
+    @property
+    def model_calls(self) -> int:
+        return self.num_blocks * self.calls_per_block
+
+    def context_len(self, prompt_len: int, block_id: int) -> int:
+        """Keys each query of block ``block_id`` attends to: prefix + the whole block."""
+        return prompt_len + (block_id + 1) * self.block_size
+
+
+# Every project_param key Project 3 understands (course helper H1). An unknown key is
+# almost always a typo, which would otherwise silently fall back to a default.
+PROJECT_PARAM_KEYS = {
+    "decode_schedule",       # "autoregressive" (default) or "block_diffusion"
+    "block_size",            # b
+    "refine_rounds",         # R
+    "kv_save_pass",          # true: R + 1 calls per block
+    "decode_head_all_rows",  # true: price the decode output head for all B*q rows (see inference_timing)
+}
+
+
+def project_flag(project_param, key: str) -> bool:
+    """Read a true/false ``project_param`` entry strictly (a quoted "false" is not true)."""
+    value = dict(project_param or {}).get(key, False)
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"project_param.{key} must be true or false, got {value!r}")
+
+
+def block_diffusion_schedule(project_param, decode_len: int) -> Optional[BlockDiffusionSchedule]:
+    """Return the block-diffusion schedule, or None for normal autoregressive decode."""
+    project_param = dict(project_param or {})
+    unknown = set(project_param) - PROJECT_PARAM_KEYS
+    if unknown:
+        raise ValueError(f"Unknown project_param keys: {sorted(unknown)}")
+    schedule = str(project_param.get("decode_schedule", "autoregressive")).strip().lower()
+    if schedule == "autoregressive":
+        return None
+    if schedule != "block_diffusion":
+        raise ValueError(
+            f"project_param.decode_schedule must be 'autoregressive' or 'block_diffusion', got {schedule!r}"
+        )
+    b = int(project_param.get("block_size", 1))
+    r = int(project_param.get("refine_rounds", 1))
+    kv_save = project_flag(project_param, "kv_save_pass")
+    if b < 1 or r < 1:
+        raise ValueError(f"block_size and refine_rounds must be >= 1 (got b={b}, R={r})")
+    if decode_len % b != 0:
+        raise ValueError(f"decode_len ({decode_len}) must be a multiple of block_size ({b})")
+    return BlockDiffusionSchedule(block_size=b, refine_rounds=r, kv_save_pass=kv_save, decode_len=int(decode_len))
+
+
 class DecodeGraph(Graph):
     """
     Graph builder for autoregressive decode phase.
@@ -112,6 +189,10 @@ class DecodeGraph(Graph):
         self.qk_rope_head_dim = getattr(attention_cfg, "qk_rope_head_dim", None)
         self.v_head_dim = getattr(attention_cfg, "v_head_dim", None)
         self.run_type = str(getattr(model_cfg, "run_type", "inference")).lower()
+        self.schedule = block_diffusion_schedule(
+            getattr(model_config, "project_param", None), config.decode_len
+        )
+        self.schedule_info: Dict[str, Any] = {}
 
     def build_decode_graph(self) -> Tuple[float, List[DecodeSample]]:
         """
@@ -123,6 +204,9 @@ class DecodeGraph(Graph):
         Returns:
             Tuple of (total_decode_time, list_of_decode_samples)
         """
+        if self.schedule is not None:
+            return self._build_block_diffusion_decode()
+
         # Determine decode steps we actually simulate
         sample_points = self._generate_sample_points()
 
@@ -168,23 +252,100 @@ class DecodeGraph(Graph):
 
         return total_decode_time, total_decode_energy, decode_samples
 
-    def _generate_sample_points(self) -> List[int]:
-        """Generate decode step sample points based on sampling configuration."""
+    def _generate_sample_points(self, n_steps: Optional[int] = None, every: Optional[int] = None) -> List[int]:
+        """Generate decode step sample points based on sampling configuration.
+
+        ``n_steps``/``every`` default to the token-level decode loop; block diffusion
+        passes the number of blocks and a block-level interval instead.
+        """
+        n_steps = self.config.decode_len if n_steps is None else n_steps
+        every = self.config.sample_every if every is None else every
         sample_points = []
 
         # Always sample step 0 (first decode step)
         sample_points.append(0)
 
         # Sample at regular intervals
-        for step_id in range(self.config.sample_every - 1, self.config.decode_len, self.config.sample_every):
+        for step_id in range(every - 1, n_steps, every):
             sample_points.append(step_id)
 
         # Always sample the last step if configured
-        last_step = self.config.decode_len - 1
+        last_step = n_steps - 1
         if last_step not in sample_points:
             sample_points.append(last_step)
 
         return sorted(sample_points)
+
+    def _build_block_diffusion_decode(self):
+        """Project 3: walk blocks instead of tokens.
+
+        Block k (0-based) is refined by ``calls_per_block`` model calls. Each call processes
+        q = b positions and attends to prompt + k*b finished tokens + the b block positions,
+        so every call of block k has the same shape. Calls are priced at sampled blocks and
+        joined with the trapezoid rule over the block index, exactly like the token loop.
+        """
+        sched = self.schedule
+        b = sched.block_size
+        n_blocks = sched.num_blocks
+        # sample_every counts tokens; convert it to blocks (b = 1 keeps it unchanged, and
+        # the "first and last only" sentinel stays larger than any block count).
+        block_every = max(1, self.config.sample_every // b)
+        sample_points = self._generate_sample_points(n_steps=n_blocks, every=block_every)
+
+        decode_samples = []
+        for block_id in sample_points:
+            total_seq_len = sched.context_len(self.config.seq_len, block_id)
+            gemm_shapes = llm_util.process_decode_gemm_shapes(
+                self,
+                batch_size=self.config.batch_size,
+                current_seq_len=total_seq_len,
+                d_model=self.config.hidden_dim,
+                num_heads=self.config.num_heads,
+                kv_heads=self.config.kv_heads,
+                intermediate_size=self.moe_intermediate_size if self.use_moe else self.config.intermediate_size,
+                vocab_size=self.config.vocab_size,
+                model_type=self.model_config.model_config.model_type,
+                query_tokens=b,
+            )
+            call_time, call_energy = self._execute_decode_step(
+                step_id=block_id,
+                total_seq_len=total_seq_len,
+                gemm_shapes=gemm_shapes,
+                query_tokens=b,
+            )
+            decode_samples.append(
+                DecodeSample(
+                    step_id=block_id,
+                    current_seq_len=total_seq_len,
+                    execution_time=call_time,
+                    execution_energy=call_energy,
+                    graph_root=None,
+                    kv_cache_tokens=total_seq_len,
+                )
+            )
+
+        # Integrate one call per block, then charge every call of the block.
+        one_call_time, one_call_energy = self._integrate_decode_samples(decode_samples, n_steps=n_blocks)
+        cpb = sched.calls_per_block
+        total_time = cpb * one_call_time
+        total_energy = cpb * one_call_energy
+        self.schedule_info = {
+            "block_size": b,
+            "refine_rounds": sched.refine_rounds,
+            "kv_save_pass": sched.kv_save_pass,
+            "blocks": n_blocks,
+            "calls_per_block": cpb,
+            "model_calls": sched.model_calls,
+            "time_per_call_first": decode_samples[0].execution_time,
+            "time_per_call_last": decode_samples[-1].execution_time,
+            "first_block_time": cpb * decode_samples[0].execution_time,
+            "position_passes": sched.model_calls * b,
+        }
+        print(
+            f"[diffusion] block decode: b={b}, R={sched.refine_rounds}, kv_save_pass={sched.kv_save_pass}, "
+            f"blocks={n_blocks}, calls_per_block={cpb}, total={total_time:.4f}s"
+        )
+        return total_time, total_energy, decode_samples
 
     def _execute_decode_step(
         self,
@@ -272,7 +433,7 @@ class DecodeGraph(Graph):
             )
         return result.total_time, energy
 
-    def _integrate_decode_samples(self, samples: List[DecodeSample]) -> float:
+    def _integrate_decode_samples(self, samples: List[DecodeSample], n_steps: Optional[int] = None) -> float:
         """
         Integrate execution times between sample points using linear interpolation.
 
@@ -315,7 +476,8 @@ class DecodeGraph(Graph):
             )
 
         last_sample = samples[-1]
-        remaining_steps = self.config.decode_len - (last_sample.step_id + 1)
+        n_steps = self.config.decode_len if n_steps is None else n_steps
+        remaining_steps = n_steps - (last_sample.step_id + 1)
         if remaining_steps > 0:
             tail_time = remaining_steps * last_sample.execution_time
             total_time += tail_time

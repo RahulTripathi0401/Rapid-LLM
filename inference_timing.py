@@ -27,7 +27,13 @@ from train_timing import (
     COMM_RULE_DEFAULT_KEY,
 )
 from memory_estimation import MemoryEstimator
-from simulate_inference_graph import DecodeSample, InferenceConfig, InferenceEngine
+from simulate_inference_graph import (
+    DecodeSample,
+    InferenceConfig,
+    InferenceEngine,
+    block_diffusion_schedule,
+    project_flag,
+)
 import llm_util
 import json
 from timing_model import CollectiveType, CommSpec, DirectionTiming, OperationTiming, OperationGroup
@@ -138,7 +144,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         mla_decode = str(getattr(self, "attention_type", "mha")).lower() == "mla" and run_type == "inference"
 
 
-        output_seq_len = 1  # tokens per decode call; query_tokens (H2) is threaded but unused
+        output_seq_len = int(query_tokens)  # Project 3: positions processed per decode call (q)
 
         transformer_timings: Dict[str, OperationTiming] = {}
 
@@ -497,6 +503,11 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             self.hidden_dim,
             self.vocab_size,
         )
+        if project_flag(self.project_param, "decode_head_all_rows"):
+            # single_gpu_gemm_forward prices a non-attention 4-D GEMM by its M only, so the
+            # shape above charges the head's matmul for q rows whatever the batch (prefill
+            # passes B*S rows). Opt-in sensitivity check: fold the batch into M.
+            linear_shape = (1, batch_size * output_seq_len, self.hidden_dim, self.vocab_size)
         linear_softmax_f, linear_softmax_mem = self.get_linear_softmax_f(linear_shape)
         if getattr(self, "disable_embedding_unembedding", False):
             linear_softmax_f = 0.0
@@ -660,7 +671,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             moe_node_breakdown=moe_node_breakdown,
             moe_transformer_timings=moe_transformer_timings,
             batch_size=batch_size,
-            seq_len=1,
+            seq_len=int(query_tokens),
             hidden_dim=self.hidden_dim,
             intermediate_size=self.intermediate_size,
             vocab_size=self.vocab_size,
@@ -885,6 +896,9 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             )
 
         decode_peak_gb = prefill_peak_gb
+        # Project 3: a block-diffusion call holds activations for q = b positions.
+        diffusion_schedule = block_diffusion_schedule(self.project_param, decode_len)
+        decode_query_tokens = diffusion_schedule.block_size if diffusion_schedule else 1
         if decode_len > 0:
             decode_gemm_shapes = llm_util.process_decode_gemm_shapes(
                 self,
@@ -896,7 +910,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
                 intermediate_size=self.moe_intermediate_size if self.use_moe else intermediate_size,
                 vocab_size=vocab_size,
                 model_type=self.model_type,
-                query_tokens=1,  # H2: tokens per decode call for the decode memory peak
+                query_tokens=decode_query_tokens,  # H2: tokens per decode call for the decode memory peak
             )
             (
                 decode_pipeline_graph,
@@ -914,7 +928,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
                 batch_size=batch_size,
                 total_seq_len=self.seq_len,
                 gemm_shapes=decode_gemm_shapes,
-                query_tokens=1,
+                query_tokens=decode_query_tokens,
             )
             decode_dispatcher = LLMExecutionDispatcher(
                 time_calc=self,
@@ -932,7 +946,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             decode_memory_data = mem_estimator.build_memory_data(
                 mode="inference",
                 batch_size=batch_size,
-                seq_len=1,
+                seq_len=decode_query_tokens,
                 gemm_shapes=decode_gemm_shapes,
                 kv_cache_tokens=self.seq_len,
             )
@@ -1040,8 +1054,9 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         )
 
         # Build decode phase using sample-based approach with real RAPID-LLM integration
-        # decode_time, decode_energy, decode_samples = inference_engine._build_decode_graph()
-        return inference_engine._build_decode_graph()
+        result = inference_engine._build_decode_graph()
+        self.decode_schedule_info = dict(inference_engine.decode_graph.schedule_info)
+        return result
 
     def calc_total_inference_time(self) -> dict:
         """
@@ -1056,9 +1071,14 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         decode_time, decode_energy, decode_samples = self.calc_decode_time()
         total_time = prefill_time + decode_time
 
+        schedule_info = getattr(self, "decode_schedule_info", None) or {}
         time_to_first_token = prefill_time
         if decode_samples:
-            time_to_first_token += decode_samples[0].execution_time
+            if schedule_info:
+                # Block diffusion: the first tokens appear when the first block is done.
+                time_to_first_token += schedule_info["first_block_time"]
+            else:
+                time_to_first_token += decode_samples[0].execution_time
 
         head_dim = getattr(self, "head_dim", None)
         if head_dim is None:
@@ -1086,6 +1106,12 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         decode_fetch_bytes = token_bytes * num_layers * (
             decode_len * (prefill_len + self.seq_len) // 2
         )
+        if schedule_info:
+            # Every call of block k reads prompt + (k+1)*b keys/values.
+            b = schedule_info["block_size"]
+            n_blocks = schedule_info["blocks"]
+            ctx_sum = n_blocks * prefill_len + b * n_blocks * (n_blocks + 1) // 2
+            decode_fetch_bytes = token_bytes * num_layers * schedule_info["calls_per_block"] * ctx_sum
 
         def _to_gib(byte_val: int) -> str:
             gib_val = byte_val / (1024 ** 3)
@@ -1094,7 +1120,9 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
                 return f"{tib_val:.1f} TiB"
             return f"{gib_val:.1f} GiB"
 
-        if decode_samples:
+        if decode_samples and schedule_info:
+            decode_rates = self._block_diffusion_rates(decode_samples, schedule_info, decode_len, decode_time)
+        elif decode_samples:
             # do NOT use effective_transformer_batch here
             decode_rates = self._decode_token_rates(decode_samples, decode_len, decode_time, self.batch_size)
         else:
@@ -1112,6 +1140,15 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
                 f"decode_fetch={_to_gib(decode_fetch_bytes)}"
             )
         
+        if schedule_info:
+            print(
+                "[diffusion] model_calls={model_calls} blocks={blocks} calls_per_block={calls_per_block} "
+                "position_passes={position_passes} time_per_call_first={time_per_call_first:.6f} "
+                "time_per_call_last={time_per_call_last:.6f} ttft={ttft:.6f}".format(
+                    ttft=time_to_first_token, **schedule_info
+                )
+            )
+
         total_energy = prefill_energy + decode_energy
         prefill_denom = self._effective_transformer_batch() * prefill_len
         decode_denom = self._effective_transformer_batch() * decode_len
@@ -1135,6 +1172,26 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             "kv_cache_decode_store_bytes": decode_store_bytes,
             "kv_cache_decode_fetch_bytes": decode_fetch_bytes,
             "decode_tokens_per_s": decode_rates,
+            "decode_schedule": schedule_info,
+        }
+
+    @classmethod
+    def _block_diffusion_rates(cls, samples, schedule_info, decode_len, total_decode_time) -> Dict[str, float]:
+        """Per-sequence output rate (tokens/s) for block diffusion.
+
+        The samples are one call per block, so the token-loop helper gives calls per second
+        at the first, middle and last block; a block finishes b tokens in calls_per_block calls.
+        """
+        b = schedule_info["block_size"]
+        n_blocks = schedule_info["blocks"]
+        per_call = cls._decode_token_rates(samples, n_blocks, total_decode_time, batch_size=1)
+        scale = b / schedule_info["calls_per_block"]
+        return {
+            "start": per_call["start"] * scale,
+            "midpoint": per_call["midpoint"] * scale,
+            "end": per_call["end"] * scale,
+            "midpoint_step": per_call["midpoint_step"] * b,
+            "overall": decode_len / total_decode_time if total_decode_time > 0 else 0.0,
         }
 
     @staticmethod
