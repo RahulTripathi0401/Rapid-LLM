@@ -31,20 +31,76 @@ Output 256 gives the same ratios (1.97×, 1.54×, 0.92×). With one extra K/V-sa
   b = 16, R = 4 at the largest batch that fits is 1.07× at 2K, 1.94× at 8K and 2.62× at 32K.
 - Peak memory and the batch that fits are unchanged; the first tokens arrive later.
 
-### Running it
+### Setup
+
+Python 3.12 (3.11+ works). No GPU is needed: RAPID-LLM is an analytical model.
 
 ```bash
-python -m venv .venv && source .venv/bin/activate      # Python 3.12
+git clone -b p3-block-diffusion https://github.com/RahulTripathi0401/Rapid-LLM.git
+cd Rapid-LLM
+python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt pytest matplotlib
-pytest -q                                              # 50 passed, 2 skipped
+```
 
-# one block-diffusion run (batch 1, prompt 512, output 128, b = 8, R = 4)
+`requirements.txt` is the course's (numpy, pandas, pyyaml, graphviz); `pytest` runs the tests and
+`matplotlib` draws the figures. No other inputs are needed: the model and hardware configs are in
+`configs/`.
+
+### Reproducing the presentation in one command
+
+```bash
+python reproduce.py            # everything: about 50 min on 8 cores
+python reproduce.py --quick    # about 5 min: skips the two long sweeps, replots from the saved CSVs
+```
+
+`reproduce.py` runs, in order: the unit tests, the feature-off regression check, every evaluation,
+the tiler probe, the report and presentation figures, and `course_p3/results/presentation_numbers.md`,
+which lists every number on every slide next to the file it comes from. It stops at the first
+failure. `P3_WORKERS=4 python reproduce.py` runs fewer simulations in parallel on a smaller machine.
+
+Which output backs which slide (the deck has 12 slides):
+
+| Slide | What it shows | Produced by | Output |
+|---|---|---|---|
+| 3 | 12.11 ms vs 12.16 ms per call at batch 1 | `evaluate.py crossover` | `results/crossover.csv`; numbers in `results/presentation_numbers.md` |
+| 5 | Feature off matches the original; tests pass | `regress.py check`, `pytest -q` | console output; baseline in `course_p3/baseline.json` |
+| 6 | Required evaluation table (time, calls, peak memory, TTFT, FLOPs) | `evaluate.py required` | `results/required.csv`; table in `presentation_numbers.md` |
+| 7 | Cost of one call vs batch | `evaluate.py crossover`, `slide_figs.py` | `figures/slides/call_time.png` |
+| 8 | Speedup vs batch for 2K / 8K / 32K prompts | `evaluate.py sweep`, `slide_figs.py` | `figures/slides/sweep.png`, `results/sweep.csv` |
+| 9 | A100 vs H100 crossover and table | `evaluate.py crossover`, `slide_figs.py` | `figures/slides/crossover.png`, `results/crossover_summary.csv` |
+| 10 | Batch-64 speedups compared with Fast-dLLM v2 | `evaluate.py crossover` | `results/crossover.csv`; table in `presentation_numbers.md` |
+| 11 | Tiler cliff table; output-head sensitivity | `tiler_probe.py`, `evaluate.py head` | `results/tiler_probe.csv`, `results/head_sensitivity_summary.csv` |
+
+All paths above are under `course_p3/`. The report's figures go to `course_p3/figures/` and its
+text is `course_p3/REPORT.md`. Slides 1, 2, 4 and 12 have no measured numbers of their own.
+
+Individual steps, if you want to run one:
+
+```bash
+python course_p3/regress.py check          # feature off: 11 runs byte-identical to the original code
+python course_p3/evaluate.py required      # ~1 min  -> course_p3/results/required.csv
+python course_p3/evaluate.py sweep         # ~25 min -> course_p3/results/sweep.csv
+python course_p3/evaluate.py crossover     # ~25 min -> course_p3/results/crossover.csv
+python course_p3/evaluate.py head          # ~2 min  -> course_p3/results/head_sensitivity.csv
+python course_p3/tiler_probe.py            # seconds -> course_p3/results/tiler_probe.csv
+python course_p3/plots.py                  # report figures -> course_p3/figures/
+python course_p3/slide_figs.py             # presentation figures -> course_p3/figures/slides/
+python course_p3/summarize.py              # -> course_p3/results/presentation_numbers.md
+```
+
+`regress.py check` compares against `course_p3/baseline.json`, recorded before any code change
+(the course's `course/regress.py` is not on this branch, so this is the equivalent).
+
+### One block-diffusion run
+
+```bash
 python run_perf.py --hardware_config configs/hardware-config/course_project/a100_80GB_1gpu.yaml \
                    --model_config configs/model-config/course_project/Llama3.1-8B_block_diffusion.yaml
 ```
 
-The run prints a `[diffusion]` line with the model calls, blocks and time per call. To use block
-diffusion with any model config, add this block next to `model_param` (course helper H1):
+This is the required evaluation's batch-1 case. It prints a `[diffusion]` line with the model
+calls, blocks and time per call; results also go to `output/LLM/`. To use block diffusion with any
+model config, add this block next to `model_param` (course helper H1):
 
 ```yaml
 project_param:
@@ -55,21 +111,6 @@ project_param:
   decode_head_all_rows: false        # true: sensitivity check, see "Notes" below
 ```
 
-Reproduce every number in the report:
-
-```bash
-python course_p3/regress.py check          # feature off: 11 runs byte-identical to the original code
-python course_p3/evaluate.py required      # ~1 min  -> course_p3/results/required.csv
-python course_p3/evaluate.py sweep         # ~25 min -> results/sweep.csv (prompt 2K/8K/32K grid)
-python course_p3/evaluate.py crossover     # ~25 min -> results/crossover.csv (A100 vs H100)
-python course_p3/evaluate.py head          # ~2 min  -> results/head_sensitivity.csv
-python course_p3/plots.py                  # report figures -> course_p3/figures/
-python course_p3/slide_figs.py             # presentation figures -> course_p3/figures/slides/
-```
-
-`regress.py check` compares against `course_p3/baseline.json`, recorded before any code change
-(the course's `course/regress.py` is not on this branch, so this is the equivalent).
-
 ### Code changes
 
 | File | Change |
@@ -78,7 +119,8 @@ python course_p3/slide_figs.py             # presentation figures -> course_p3/f
 | `inference_timing.py` | Decode layer timing uses q positions (norms, residuals, MoE tokens, output head); decode peak memory uses q = b; time to first token, tokens/s and KV-read bytes follow the block schedule; prints the `[diffusion]` summary. |
 | `simulate_inference_graph.py` | `BlockDiffusionSchedule` and `block_diffusion_schedule()` parse and validate `project_param`; `_build_block_diffusion_decode` walks blocks instead of tokens (sampled blocks, trapezoid rule over the block index, `calls_per_block` calls each). |
 | `tests/test_block_diffusion.py` | 14 tests: q = 1 shapes unchanged, q scales rows but not weights or context, call counts, the neutral schedule, input validation. |
-| `course_p3/` | Regression check, run helpers, evaluation, plots, results (CSV), figures and the report. |
+| `reproduce.py` | One-shot reproduction of every result. |
+| `course_p3/` | Regression check, run helpers, evaluation, tiler probe, plots, per-slide numbers, results (CSV), figures and the report. |
 
 ### Checks
 
