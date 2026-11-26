@@ -1,0 +1,8 @@
+# Lint settings for the Project 3 scripts (run: ruff check course_p3 reproduce.py).
+line-length = 120
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W", "B", "SIM"]
+# pandas column comparisons such as `d.O == o` read as "Yoda conditions" to SIM300.
+ignore = ["SIM300"]

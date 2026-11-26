@@ -56,17 +56,18 @@ def main():
     out += ["## Slide 3: a decode call is limited by memory",
             "Source: `results/crossover.csv` (A100, prompt 512, batch 1).",
             f"- AR call (1 position): **{ar_call:.2f} ms**",
-            f"- Diffusion call (8 positions, b = 8): **{d_call:.2f} ms** (+{(d_call / ar_call - 1) * 100:.1f}%)",
+            f"- Diffusion call (8 positions, b = 8): **{d_call:.2f} ms** (+{(d_call / ar_call - 1) * 100:.2f}%)",
             "- 16 GB = Llama-3.1-8B parameters (about 8.0 B) × 2 bytes (BF16).", ""]
 
     # slide 6
     rows = []
-    for (B, O), g in req.groupby(["B", "O"]):
+    for (B, out_len), g in req.groupby(["B", "O"]):
         ar = g[g.schedule == "AR"].iloc[0]
         for _, r in g[g.schedule != "AR"].iterrows():
-            rows.append({"batch": B, "output": O, "schedule": r.schedule_name,
+            rows.append({"batch": B, "output": out_len, "schedule": r.schedule_name,
                          "AR total (s)": round(ar.total_s, 3), "diffusion total (s)": round(r.total_s, 3),
-                         "speedup": f"{ar.total_s / r.total_s:.2f}×", "calls": f"{int(ar.model_calls)} → {int(r.model_calls)}",
+                         "speedup": f"{ar.total_s / r.total_s:.2f}×",
+                         "calls": f"{int(ar.model_calls)} → {int(r.model_calls)}",
                          "TTFT AR / diff (s)": f"{ar.ttft_s:.3f} / {r.ttft_s:.3f}",
                          "peak GiB AR / diff": f"{ar.peak_gib:.2f} / {r.peak_gib:.2f}",
                          "decode TFLOP AR / diff": f"{ar.decode_tflop:.1f} / {r.decode_tflop:.1f}"})
@@ -75,7 +76,8 @@ def main():
     # slide 7
     a = cross[(cross.hw == A100) & (cross.S == 512)].copy()
     a["cfg"] = cfg(a)
-    p = a[a.cfg.isin(["AR", "b=8, R=4"])].pivot_table(index="B", columns="cfg", values="ms_per_call").round(2).reset_index()
+    shown = a[a.cfg.isin(["AR", "b=8, R=4"])]
+    p = shown.pivot_table(index="B", columns="cfg", values="ms_per_call").round(2).reset_index()
     out += ["## Slide 7: cost of one call vs batch (figure `figures/slides/call_time.png`)",
             "Source: `results/crossover.csv` (A100, prompt 512). Milliseconds per model call:", "", md_table(p), ""]
 
@@ -100,12 +102,14 @@ def main():
         rows.append({"GPU": "A100" if hw == A100 else "H100", "setting": c,
                      "first batch where AR wins": int(lose.B.iloc[0]) if len(lose) else f"none ≤ {int(g.B.max())}"})
     out += ["## Slide 9: A100 vs H100 (figure `figures/slides/crossover.png`)",
-            "Source: `results/crossover.csv`, prompt 512, output 128. b = 32 is affected by the tiler cliff (slide 11).", "",
+            "Source: `results/crossover.csv`, prompt 512, output 128. "
+            "b = 32 is affected by the tiler cliff (slide 11).", "",
             md_table(pd.DataFrame(rows)), ""]
     v = x[(x.S == 512) & (x.B == 64)].pivot_table(index="cfg", columns="hw", values="speedup").round(2).reset_index()
     v.columns = ["setting"] + ["A100" if c == A100 else "H100" for c in v.columns[1:]]
     out += ["## Slide 10: validation (speedup at batch 64, prompt 512)",
-            "Source: `results/crossover.csv`. Compared with Fast-dLLM v2 (arXiv 2509.26328): up to 1.5× (A100), 1.8× (H100).", "",
+            "Source: `results/crossover.csv`. Compared with Fast-dLLM v2 (arXiv 2509.26328): "
+            "up to 1.5× (A100), 1.8× (H100).", "",
             md_table(v), ""]
 
     # slide 11

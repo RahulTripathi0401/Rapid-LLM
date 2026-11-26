@@ -6,7 +6,7 @@ Slide numbers follow the deck (12 slides). Simulated: Llama-3.1-8B, one GPU, RAP
 ## Slide 3: a decode call is limited by memory
 Source: `results/crossover.csv` (A100, prompt 512, batch 1).
 - AR call (1 position): **12.11 ms**
-- Diffusion call (8 positions, b = 8): **12.16 ms** (+0.5%)
+- Diffusion call (8 positions, b = 8): **12.16 ms** (+0.45%)
 - 16 GB = Llama-3.1-8B parameters (about 8.0 B) × 2 bytes (BF16).
 
 ## Slide 6: required evaluation

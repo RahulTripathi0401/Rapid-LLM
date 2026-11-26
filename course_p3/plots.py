@@ -26,7 +26,7 @@ def required():
     d.loc[kv_save, "variant"] = "diffusion, R+1 calls"
     d.loc[d.schedule == "AR", "variant"] = "AR"
     fig, axes = plt.subplots(1, 2, figsize=(8, 3))
-    for ax, o in zip(axes, (128, 256)):
+    for ax, o in zip(axes, (128, 256), strict=True):
         p = d[d.O == o].pivot(index="B", columns="variant", values="total_s")
         p[["AR", "diffusion, R calls", "diffusion, R+1 calls"]].plot.bar(ax=ax, rot=0)
         ax.set_title(f"Llama-3.1-8B, A100, prompt 512, output {o}")
@@ -44,7 +44,7 @@ def sweep():
     dd["cfg"] = dd.apply(_key, axis=1)
     Ss = sorted(d.S.unique())
     fig, axes = plt.subplots(1, len(Ss), figsize=(4 * len(Ss), 3.4), sharey=True)
-    for ax, S in zip(axes, Ss):
+    for ax, S in zip(axes, Ss, strict=True):
         sub = dd[dd.S == S]
         for cfg, g in sub.groupby("cfg", sort=False):
             g = g.sort_values("B")
@@ -78,7 +78,7 @@ def crossover():
     dd["cfg"] = dd.apply(_key, axis=1)
     fig, axes = plt.subplots(1, 2, figsize=(8.5, 3.4), sharey=True)
     styles = {"a100_80GB_1gpu": "-", "H100_SXM5_80GB": "--"}
-    for ax, S in zip(axes, sorted(d.S.unique())):
+    for ax, S in zip(axes, sorted(d.S.unique()), strict=True):
         for (hw, cfg), g in dd[dd.S == S].groupby(["hw", "cfg"], sort=False):
             g = g.sort_values("B")
             ax.plot(g.B, g.speedup, styles.get(hw, "-"), marker="o", ms=2.5,

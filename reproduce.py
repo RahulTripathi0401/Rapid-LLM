@@ -39,16 +39,19 @@ def main():
     step("Feature off: 11 runs must match the original code byte for byte", [os.path.join(P3, "regress.py"), "check"])
     step("Required evaluation (presentation slide 6)", [os.path.join(P3, "evaluate.py"), "required"])
     if not args.quick:
-        step("Case study 1: prompt length x batch x (b, R) (slide 8)", [os.path.join(P3, "evaluate.py"), "sweep"])
-        step("Case study 2: A100 vs H100 crossover (slides 3, 7, 9, 10)", [os.path.join(P3, "evaluate.py"), "crossover"])
+        step("Case study 1: prompt length x batch x (b, R) (slide 8)",
+             [os.path.join(P3, "evaluate.py"), "sweep"])
+        step("Case study 2: A100 vs H100 crossover (slides 3, 7, 9, 10)",
+             [os.path.join(P3, "evaluate.py"), "crossover"])
     step("Output-head sensitivity (slide 11)", [os.path.join(P3, "evaluate.py"), "head"])
     step("Tiler cliff probe (slide 11)", [os.path.join(P3, "tiler_probe.py")])
     step("Report figures", [os.path.join(P3, "plots.py")])
     step("Presentation figures", [os.path.join(P3, "slide_figs.py")])
     step("Every number on every slide", [os.path.join(P3, "summarize.py")])
 
+    note = "  (--quick: sweep.csv and crossover.csv were not re-run)" if args.quick else ""
     print(f"""
-All done in {(time.time() - begin) / 60:.1f} min.{'  (--quick: sweep.csv and crossover.csv were not re-run)' if args.quick else ''}
+All done in {(time.time() - begin) / 60:.1f} min.{note}
 
 Outputs (see "Reproducing the presentation" in README.md for the slide-by-slide map):
   course_p3/results/presentation_numbers.md   every number on every slide, with its source CSV

@@ -66,7 +66,7 @@ def sweep():
     x = speedups(d, ["S", "B"])
     cfgs = [((8, 4), DIFF, "-"), ((16, 4), DIFF2, "-"), ((8, 2), DIFF3, "-"), ((16, 8), MUTED, "--")]
     fig, axes = plt.subplots(1, 3, figsize=(16, 6.8), sharey=True)
-    for ax, S, name in zip(axes, (2048, 8192, 32768), ("2K", "8K", "32K")):
+    for ax, S, name in zip(axes, (2048, 8192, 32768), ("2K", "8K", "32K"), strict=True):
         sub = x[x.S == S]
         for (b, r), c, ls in cfgs:
             g = sub[(sub.b == b) & (sub.R == r)].sort_values("B")
@@ -79,8 +79,8 @@ def sweep():
         ax.set_xlabel("batch B")
         ax.set_ylim(0, 4.4)
     axes[0].set_ylabel("decode speedup vs AR")
-    h, l = axes[0].get_legend_handles_labels()
-    fig.legend(h, l, loc="upper center", ncol=4, frameon=False)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False)
     fig.tight_layout(rect=(0, 0, 1, 0.9))
     fig.savefig(os.path.join(OUT, "sweep.png"), dpi=150)
 

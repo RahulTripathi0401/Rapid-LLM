@@ -24,9 +24,9 @@ OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 WORKERS = int(os.environ.get("P3_WORKERS", "8"))
 
 # Llama-3.1-8B shape (for the analytic FLOP count only; timing comes from RAPID-LLM)
-H, L, I, V, NH, KVH = 4096, 32, 14336, 128256, 32, 8
+H, L, FFN, V, NH, KVH = 4096, 32, 14336, 128256, 32, 8
 HD = H // NH
-LAYER_PARAMS = H * (H + 2 * KVH * HD) + H * H + 3 * H * I
+LAYER_PARAMS = H * (H + 2 * KVH * HD) + H * H + 3 * H * FFN
 
 
 def call_flops(batch, q, ctx):
@@ -95,18 +95,18 @@ def run_jobs(jobs, name):
 def required():
     jobs = []
     for B in (1, 16, 64):
-        for O in (128, 256):
-            base = dict(B=B, S=512, O=O)
+        for out_len in (128, 256):
+            base = dict(B=B, S=512, O=out_len)
             jobs.append(dict(base))
             jobs.append(dict(base, b=8, R=4))
             jobs.append(dict(base, b=8, R=4, kv_save=True))
     return run_jobs(jobs, "required")
 
 
-def max_batch(S, O, hw=HW_A100):
+def max_batch(S, out_len, hw=HW_A100):
     """Largest batch whose AR peak memory fits in 80 GiB (doubling, then bisection)."""
     def fits(B):
-        cfg = make_model_config(LLAMA8B, batch=B, prompt=S, output=O)
+        cfg = make_model_config(LLAMA8B, batch=B, prompt=S, output=out_len)
         return run_config(cfg, hw).peak_gib <= 80.0
 
     lo, hi = 1, 2

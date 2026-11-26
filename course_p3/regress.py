@@ -69,7 +69,11 @@ def main(mode):
         if got != data[name]:
             bad += 1
             exp = data[name]["stdout"]
-            diff = [f"  - {a}\n  + {b}" for a, b in zip(exp, got["stdout"]) if a != b][:5]
+            diff = [f"  - {a}\n  + {b}" for a, b in zip(exp, got["stdout"], strict=False) if a != b][:5]
+            if len(exp) != len(got["stdout"]):
+                diff.append(f"  output has {len(got['stdout'])} lines, baseline has {len(exp)}")
+            if got["peak_gib"] != data[name]["peak_gib"]:
+                diff.append(f"  peak memory {got['peak_gib']} GiB, baseline {data[name]['peak_gib']} GiB")
             print(f"FAIL {name}\n" + "\n".join(diff))
         else:
             print(f"ok   {name}")
